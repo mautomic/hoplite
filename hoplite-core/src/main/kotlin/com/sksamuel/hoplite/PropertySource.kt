@@ -6,7 +6,6 @@ import com.sksamuel.hoplite.fp.invalid
 import com.sksamuel.hoplite.fp.valid
 import com.sksamuel.hoplite.parsers.Parser
 import com.sksamuel.hoplite.parsers.ParserRegistry
-import com.sksamuel.hoplite.parsers.defaultParserRegistry
 import com.sksamuel.hoplite.parsers.toNode
 import java.io.File
 import java.io.InputStream
@@ -16,10 +15,16 @@ import java.util.*
 
 /**
  * A [PropertySource] provides [Node]s.
- * A source may retrieve its values from a config file, or env variables, and so on.
+ *
+ * A property source may retrieve its values from a config file, or env variables, system properties, and so on,
+ * depending on the implementation.
  */
 interface PropertySource {
-  fun node(): ConfigResult<Node>
+
+  /**
+   * Returns the node associated with this property source
+   */
+  fun node(parsers: ParserRegistry): ConfigResult<Node>
 
   companion object {
 
@@ -46,14 +51,33 @@ interface PropertySource {
      */
     fun path(path: Path, optional: Boolean = false) =
       ConfigFilePropertySource(ConfigSource.PathSource(path), optional = optional)
+
+    /**
+     * Returns a [PropertySource] that will read the specified input stream.
+     *
+     * @param input the input stream to read from
+     * @param ext the file extension of the input format
+     */
+    fun stream(input: InputStream, ext: String) =
+      InputStreamPropertySource(input, ext)
+
+    /**
+     * Returns a [PropertySource] that will read from the specified string.
+     *
+     * @param str the string to read from
+     * @param ext the file extension of the input format
+     */
+    fun string(str: String, ext: String) =
+      stream(str.byteInputStream(), ext)
+
   }
 }
 
-fun defaultPropertySources(registry: ParserRegistry): List<PropertySource> =
+fun defaultPropertySources(): List<PropertySource> =
   listOf(
-    EnvironmentVariablesPropertySource(true, false),
+    EnvironmentVariablesPropertySource(useUnderscoresAsSeparator = true, allowUppercaseNames = false),
     SystemPropertiesPropertySource,
-    UserSettingsPropertySource(registry)
+    UserSettingsPropertySource
   )
 
 /**
@@ -64,7 +88,7 @@ fun defaultPropertySources(registry: ParserRegistry): List<PropertySource> =
  */
 object SystemPropertiesPropertySource : PropertySource {
   private const val prefix = "config.override."
-  override fun node(): ConfigResult<Node> {
+  override fun node(parsers: ParserRegistry): ConfigResult<Node> {
     val props = Properties()
     System.getProperties()
       .stringPropertyNames()
@@ -78,7 +102,7 @@ class EnvironmentVariablesPropertySource(
   private val useUnderscoresAsSeparator: Boolean,
   private val allowUppercaseNames: Boolean
 ) : PropertySource {
-  override fun node(): ConfigResult<Node> {
+  override fun node(parsers: ParserRegistry): ConfigResult<Node> {
     val props = Properties()
     System.getenv().forEach {
       val key = it.key
@@ -114,18 +138,18 @@ class EnvironmentVariablesPropertySource(
  * Eg, if you have included hoplite-yaml module in your build, then your file can be
  * ~/.userconfig.yaml
  */
-class UserSettingsPropertySource(private val parserRegistry: ParserRegistry) : PropertySource {
+object UserSettingsPropertySource : PropertySource {
 
   private fun path(ext: String): Path = Paths.get(System.getProperty("user.home")).resolve(".userconfig.$ext")
 
-  override fun node(): ConfigResult<Node> {
-    val ext = parserRegistry.registeredExtensions().firstOrNull {
+  override fun node(parsers: ParserRegistry): ConfigResult<Node> {
+    val ext = parsers.registeredExtensions().firstOrNull {
       path(it).toFile().exists()
     }
     return if (ext == null) Undefined.valid() else {
       val path = path(ext)
       val input = path.toFile().inputStream()
-      parserRegistry.locate(ext).map {
+      parsers.locate(ext).map {
         it.load(input, path.toString())
       }
     }
@@ -135,15 +159,21 @@ class UserSettingsPropertySource(private val parserRegistry: ParserRegistry) : P
 /**
  * An implementation of [PropertySource] that provides config via an [InputStream].
  * You must specify the config type in addition to the stream source.
+ *
+ * @param input the input stream that contains the config.
+ *
+ * @param ext the file extension that will be used in the parser registry to locate the
+ * correct parser to use. For example, pass in "yml" if the input stream represents a yml file.
+ * It is important the right extension type is passed in, because the input stream doesn't itself
+ * offer any indication what type of file it contains.
  */
 class InputStreamPropertySource(
   private val input: InputStream,
-  private val ext: String,
-  private val parserRegistry: ParserRegistry = defaultParserRegistry()
+  private val ext: String
 ) : PropertySource {
 
-  override fun node(): ConfigResult<Node> {
-    return parserRegistry.locate(ext).map {
+  override fun node(parsers: ParserRegistry): ConfigResult<Node> {
+    return parsers.locate(ext).map {
       it.load(input, "input-stream")
     }
   }
@@ -159,11 +189,11 @@ class InputStreamPropertySource(
  */
 class ConfigFilePropertySource(
   private val config: ConfigSource,
-  private val parserRegistry: ParserRegistry = defaultParserRegistry(),
   private val optional: Boolean = false
 ) : PropertySource {
-  override fun node(): ConfigResult<Node> {
-    val parser = parserRegistry.locate(config.ext())
+
+  override fun node(parsers: ParserRegistry): ConfigResult<Node> {
+    val parser = parsers.locate(config.ext())
     val input = config.open()
     return Validated.ap(parser, input) { a, b -> a.load(b, config.describe()) }
       .mapInvalid { ConfigFailure.MultipleFailures(it) }
@@ -171,11 +201,21 @@ class ConfigFilePropertySource(
   }
 
   companion object {
+
+    fun optionalPath(
+      path: Path,
+    ): ConfigFilePropertySource =
+      ConfigFilePropertySource(ConfigSource.PathSource(path), true)
+
+    fun optionalFile(
+      file: File,
+    ): ConfigFilePropertySource =
+      ConfigFilePropertySource(ConfigSource.FileSource(file), true)
+
     fun optionalResource(
       resource: String,
-      registry: ParserRegistry = defaultParserRegistry()
     ): ConfigFilePropertySource =
-      ConfigFilePropertySource(ConfigSource.ClasspathSource(resource), registry, true)
+      ConfigFilePropertySource(ConfigSource.ClasspathSource(resource), true)
   }
 }
 
